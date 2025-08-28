@@ -10,25 +10,37 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
-import tensorflow as tf
-from tensorflow.keras.models import load_model
+
+# Base directory for resolving model and asset paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Check if PyTorch model file exists but don't import PyTorch yet
-PYTORCH_MODEL_EXISTS = os.path.exists("best_optimized_model.pth")
+PYTORCH_MODEL_EXISTS = os.path.exists(os.path.join(BASE_DIR, "best_optimized_model.pth"))
 PYTORCH_AVAILABLE = False  # Default to False, will check on demand
 
 app = Flask(__name__)
 app.secret_key = 'your_secret_key_here'  # Change this to a secure secret key
 
 # Constants
-TF_MODEL_PATH = "best_crop_disease_model.h5"
-PYTORCH_MODEL_PATH = "best_optimized_model.pth"
+# Allow override via environment variables, otherwise use defaults in repo root
+TF_MODEL_PATH = os.path.join(
+    BASE_DIR,
+    os.environ.get("TF_MODEL_PATH", "best_crop_disease_model.h5")
+)
+ALT_TF_MODEL_PATH = os.path.join(
+    BASE_DIR,
+    os.environ.get("ALT_TF_MODEL_PATH", "best_efficientnet_crop_disease_model.h5")
+)
+PYTORCH_MODEL_PATH = os.path.join(
+    BASE_DIR,
+    os.environ.get("PYTORCH_MODEL_PATH", "best_optimized_model.pth")
+)
 IMG_SIZE = (224, 224)
 CHANNELS = 3
 
 # Always use TensorFlow for now until PyTorch issues are resolved
-USE_PYTORCH = False
-print(f"Using TensorFlow model: {TF_MODEL_PATH}")
+USE_PYTORCH = os.environ.get("MODEL_BACKEND", "tf").lower() == "torch"
+print(f"Model backend set to: {'PyTorch' if USE_PYTORCH else 'TensorFlow'}")
 
 # Note about PyTorch model
 if PYTORCH_MODEL_EXISTS:
@@ -88,16 +100,97 @@ def crop_type_from_class(class_name):
 
 # Model loading - cached to avoid reloading
 _model_cache = None
+_model_load_error = None
+
+def _resolve_tf_model_path():
+    # Prefer primary path; if missing, fallback to alternate if available
+    if os.path.exists(TF_MODEL_PATH):
+        return TF_MODEL_PATH
+    if os.path.exists(ALT_TF_MODEL_PATH):
+        print(f"Primary TF model not found at {TF_MODEL_PATH}. Using alternate: {ALT_TF_MODEL_PATH}")
+        return ALT_TF_MODEL_PATH
+    return TF_MODEL_PATH  # Return primary (will error later) for clearer messaging
+
 def get_model():
-    global _model_cache
-    if _model_cache is None:
-        _model_cache = TFModel(TF_MODEL_PATH)
-    return _model_cache
+    global _model_cache, _model_load_error
+    if _model_cache is not None:
+        return _model_cache
+    if _model_load_error is not None:
+        # Avoid repeated expensive attempts; raise the stored error
+        raise _model_load_error
+    try:
+        if USE_PYTORCH:
+            # Lazy import to avoid TF/PT conflicts when not needed
+            from importlib import import_module
+            torch = import_module("torch")
+            device = "cpu"
+            model = torch.jit.load(PYTORCH_MODEL_PATH, map_location=device) if os.path.exists(PYTORCH_MODEL_PATH) else None
+            if model is None:
+                raise FileNotFoundError(f"PyTorch model file not found at: {PYTORCH_MODEL_PATH}")
+            model.eval()
+            _model_cache = model
+        else:
+            resolved = _resolve_tf_model_path()
+            _model_cache = TFModel(resolved)
+        return _model_cache
+    except Exception as exc:
+        _model_load_error = exc
+        raise
 
 # TensorFlow model wrapper class
 class TFModel:
     def __init__(self, model_path):
-        self.model = load_model(model_path)
+        # Delay heavy imports and use Keras 3 loader with compatibility flags
+        # Define custom layers/objects that might be referenced in legacy .h5
+        import tensorflow as tf  # ensure tf present for custom layer ops
+        class GetItem(tf.keras.layers.Layer):
+            def __init__(self, key=None, **kwargs):
+                super().__init__(**kwargs)
+                self.key = key
+            def call(self, inputs):
+                try:
+                    return inputs[self.key] if self.key is not None else inputs
+                except Exception:
+                    # Fallback: return inputs unchanged to avoid hard crash
+                    return inputs
+            def get_config(self):
+                config = super().get_config()
+                config.update({"key": self.key})
+                return config
+
+        custom_objects = {
+            'GetItem': GetItem,
+        }
+        try:
+            from keras.models import load_model as keras_load_model  # Keras 3 API
+            # safe_mode=False allows loading legacy/custom layers; compile=False to avoid optimizer deps
+            self.model = keras_load_model(model_path, compile=False, safe_mode=False, custom_objects=custom_objects)
+        except Exception as first_exc:
+            # Fallback: try tf.keras loader for environments where keras is shimmed differently
+            try:
+                from tensorflow.keras.models import load_model as tf_keras_load_model
+                self.model = tf_keras_load_model(model_path, compile=False, custom_objects=custom_objects)
+            except Exception as second_exc:
+                # If an alternate .h5 exists, attempt to load it once
+                alt_path = ALT_TF_MODEL_PATH
+                if os.path.exists(alt_path) and os.path.abspath(alt_path) != os.path.abspath(model_path):
+                    try:
+                        self.model = keras_load_model(alt_path, compile=False, safe_mode=False, custom_objects=custom_objects)
+                    except Exception:
+                        try:
+                            self.model = tf_keras_load_model(alt_path, compile=False, custom_objects=custom_objects)
+                        except Exception:
+                            # Provide clearer error context
+                            raise RuntimeError(
+                                f"Failed to load TensorFlow model from '{model_path}' and alternate '{alt_path}'. "
+                                f"Primary error: {first_exc}; Fallback error: {second_exc}"
+                            )
+                else:
+                    # Provide clearer error context
+                    raise RuntimeError(
+                        f"Failed to load TensorFlow model from '{model_path}'. "
+                        f"Primary error: {first_exc}; Fallback error: {second_exc}"
+                    )
     
     def predict(self, image_array, **kwargs):
         return self.model.predict(image_array, **kwargs)
@@ -225,9 +318,24 @@ def predict():
         # Make prediction
         model = get_model()
         prediction = model.predict(arr, verbose=0)
-        class_idx = np.argmax(prediction)
-        confidence = float(np.max(prediction))
-        predicted_class = CLASS_NAMES[class_idx]
+        # Ensure prediction is numpy array
+        prediction = np.array(prediction)
+        # Handle shape (1, num_classes) or (num_classes,)
+        if prediction.ndim == 2:
+            logits = prediction[0]
+        else:
+            logits = prediction
+        # Convert to probabilities if necessary
+        if np.any(logits < 0) or np.any(logits > 1):
+            probs = softmax(logits)
+        else:
+            probs = logits / max(np.sum(logits), 1e-9)
+        class_idx = int(np.argmax(probs))
+        confidence = float(np.max(probs))
+        if class_idx < len(CLASS_NAMES):
+            predicted_class = CLASS_NAMES[class_idx]
+        else:
+            predicted_class = f"Class {class_idx}"
         is_healthy_flag = not is_diseased(predicted_class)
         crop_type = crop_type_from_class(predicted_class)
         
@@ -251,6 +359,32 @@ def predict():
         
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)})
+
+@app.route('/health')
+def health():
+    """Health check endpoint to validate environment and model availability"""
+    status = {
+        'backend': 'torch' if USE_PYTORCH else 'tf',
+        'tf_model_path': _resolve_tf_model_path() if not USE_PYTORCH else None,
+        'pytorch_model_path': PYTORCH_MODEL_PATH if USE_PYTORCH else None,
+        'model_file_exists': os.path.exists(_resolve_tf_model_path()) if not USE_PYTORCH else os.path.exists(PYTORCH_MODEL_PATH),
+        'ready': False,
+        'error': None
+    }
+    try:
+        model = get_model()
+        # Perform a lightweight dry-run with zeros
+        dummy = np.zeros((1, IMG_SIZE[0], IMG_SIZE[1], CHANNELS), dtype=np.float32)
+        if USE_PYTORCH:
+            import torch
+            with torch.no_grad():
+                out = model(torch.from_numpy(dummy).permute(0, 3, 1, 2))
+        else:
+            _ = model.predict(dummy, verbose=0)
+        status['ready'] = True
+    except Exception as exc:
+        status['error'] = str(exc)
+    return jsonify(status)
 
 if __name__ == '__main__':
     # Create static and templates folders if they don't exist
