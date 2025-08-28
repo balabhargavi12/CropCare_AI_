@@ -161,6 +161,24 @@ class TFModel:
         custom_objects = {
             'GetItem': GetItem,
         }
+        # Some legacy models serialize a custom "Stack" layer that mirrors tf.stack
+        class Stack(tf.keras.layers.Layer):
+            def __init__(self, axis=0, **kwargs):
+                super().__init__(**kwargs)
+                self.axis = axis
+            def call(self, inputs):
+                try:
+                    if isinstance(inputs, (list, tuple)):
+                        return tf.stack(list(inputs), axis=self.axis)
+                    # If inputs already a tensor, pass through
+                    return inputs
+                except Exception:
+                    return inputs
+            def get_config(self):
+                base = super().get_config()
+                base.update({"axis": self.axis})
+                return base
+        custom_objects['Stack'] = Stack
         try:
             from keras.models import load_model as keras_load_model  # Keras 3 API
             # safe_mode=False allows loading legacy/custom layers; compile=False to avoid optimizer deps
@@ -393,5 +411,8 @@ if __name__ == '__main__':
     os.makedirs('templates', exist_ok=True)
     
     print("Starting CropCare AI Flask App...")
-    print("Visit http://127.0.0.1:5000 to access the application")
-    app.run(debug=True)
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', '5000'))
+    debug_flag = os.environ.get('FLASK_DEBUG', '').lower() in ('1', 'true', 'yes')
+    print(f"Visit http://{host}:{port} to access the application")
+    app.run(host=host, port=port, debug=debug_flag)
